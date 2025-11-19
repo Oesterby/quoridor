@@ -1,42 +1,85 @@
 from __future__ import annotations
 import pygame
-from typing import Tuple
+import sys
+import argparse
+import os
+from typing import Tuple, List
+
+# Try to load .env file
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    # Fallback: manual .env parsing
+    try:
+        with open(".env", "r") as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ[key.strip()] = value.strip()
+    except FileNotFoundError:
+        pass
 from ..engine.state import GameState, Position, Wall, BOARD_SIZE
 from ..engine import rules
 from ..players.hotseat import HotseatController
 from ..players.agents.base import GameView, Agent
-from ..players.agents.human_agent import HumanAgent
-from ..players.agents.random_agent import RandomAgent
-from ..players.agents.llm_agent import LLMAgent
+from ..players.factory import AgentFactory
 
 CELL_SIZE = 60
 PADDING = 40
 BG_COLOR = (30, 30, 35)
 GRID_COLOR = (180, 180, 180)
-P1_COLOR = (50, 160, 255)
-P2_COLOR = (255, 140, 60)
+PLAYER_COLORS = [
+    (50, 160, 255),   # P1: Blue
+    (255, 140, 60),   # P2: Orange
+    (60, 220, 100),   # P3: Green
+    (220, 60, 220),   # P4: Purple
+]
 HIGHLIGHT_COLOR = (200, 220, 60)
 TEXT_COLOR = (240, 240, 240)
 
-FONT = None  # deprecated: using instance font
-
-
 class PygameHotseatUI:
-    def __init__(self):
+    def __init__(self, player_specs: List[str] | None = None):
         pygame.init()
         self.font = pygame.font.SysFont("consolas", 20)
         w = h = PADDING * 2 + CELL_SIZE * BOARD_SIZE
         self.screen = pygame.display.set_mode((w, h))
         pygame.display.set_caption("Quoridor Hotseat")
         self.clock = pygame.time.Clock()
-        self.state = GameState()
-        self.controller = HotseatController(self.state)
-        self.controller.refresh_moves()
-        # Agents (default Human vs LLM Bot). Change with number keys.
-        self.agents: list[Agent] = [HumanAgent(), LLMAgent()]
-        self._sync_player_identities()
+        
+        # Default to 2 human players if not specified
+        if not player_specs:
+            player_specs = ["human", "human"]
+            
+        self.restart_game(player_specs)
         self.running = True
         self.wall_orientation_horizontal = True  # toggle with space
+
+    def restart_game(self, player_specs: List[str]):
+        num = len(player_specs)
+        if num not in (2, 4):
+            print(f"Warning: {num} players not supported. Defaulting to 2.")
+            player_specs = player_specs[:2] if num > 2 else ["human", "human"]
+            num = 2
+            
+        self.state = GameState.new_game(num_players=num)
+        self.controller = HotseatController(self.state)
+        self.controller.refresh_moves()
+        
+        self.agents: List[Agent] = []
+        for i, spec in enumerate(player_specs):
+            try:
+                agent = AgentFactory.create(spec)
+                # If human, ensure name is set
+                if hasattr(agent, "name") and agent.name == "Human":
+                    agent.name = f"Player {i+1}"
+                self.agents.append(agent)
+            except Exception as e:
+                print(f"Error creating agent for '{spec}': {e}. Fallback to Random.")
+                self.agents.append(AgentFactory.create("random"))
+
+        self._sync_player_identities()
 
     def board_to_pixel(self, pos: Position) -> Tuple[int, int]:
         return PADDING + pos.col * CELL_SIZE, PADDING + pos.row * CELL_SIZE
@@ -65,24 +108,31 @@ class PygameHotseatUI:
         for idx, pawn in enumerate(self.state.pawns):
             x, y = self.board_to_pixel(pawn)
             rect = pygame.Rect(x + 8, y + 8, CELL_SIZE - 16, CELL_SIZE - 16)
-            color = P1_COLOR if idx == 0 else P2_COLOR
+            color = PLAYER_COLORS[idx % len(PLAYER_COLORS)]
             pygame.draw.rect(self.screen, color, rect, border_radius=8)
+            
+            # Mark current player
+            if idx == self.state.current_player:
+                pygame.draw.rect(self.screen, (255, 255, 255), rect, 2, border_radius=8)
 
     def draw_walls(self):
         for r, c, horizontal in self.state.walls:
             base_x = PADDING + c * CELL_SIZE
             base_y = PADDING + r * CELL_SIZE
             if horizontal:
-                # horizontal wall spans two cells horizontally and thickness ~10
                 rect = pygame.Rect(base_x, base_y + CELL_SIZE - 6, CELL_SIZE * 2, 12)
             else:
                 rect = pygame.Rect(base_x + CELL_SIZE - 6, base_y, 12, CELL_SIZE * 2)
             pygame.draw.rect(self.screen, (120, 60, 60), rect, border_radius=3)
 
     def draw_wall_ghost(self):
-        # Show ghost only if shift held, game running, walls available
         if self.state.winner is not None:
             return
+        
+        # Only draw ghost for human players
+        if not self.active_agent().is_human:
+            return
+            
         keys = pygame.key.get_pressed()
         if not (keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]):
             return
@@ -93,17 +143,18 @@ class PygameHotseatUI:
             return
         col = (mx - PADDING) // CELL_SIZE
         row = (my - PADDING) // CELL_SIZE
-        # Anchor must be within valid wall placement grid (0..BOARD_SIZE-2)
         if not (0 <= row < BOARD_SIZE - 1 and 0 <= col < BOARD_SIZE - 1):
             return
         candidate = Wall(row, col, self.wall_orientation_horizontal)
-        # Verify legality by checking cached legal wall moves
+        
+        # Check legality
         is_legal = any(
             m.kind == "wall" and m.wall == candidate
             for m in self.controller.legal_moves
         )
-        if not is_legal:
-            return
+        
+        color = (200, 120, 120, 120) if is_legal else (255, 50, 50, 120)
+        
         base_x = PADDING + col * CELL_SIZE
         base_y = PADDING + row * CELL_SIZE
         if candidate.horizontal:
@@ -111,10 +162,14 @@ class PygameHotseatUI:
         else:
             rect = pygame.Rect(base_x + CELL_SIZE - 6, base_y, 12, CELL_SIZE * 2)
         ghost_surface = pygame.Surface(rect.size, pygame.SRCALPHA)
-        ghost_surface.fill((200, 120, 120, 120))  # semi-transparent RGBA
+        ghost_surface.fill(color)
         self.screen.blit(ghost_surface, rect.topleft)
 
     def draw_highlights(self):
+        # Only highlight for human players
+        if not self.active_agent().is_human:
+            return
+            
         for move in self.controller.legal_moves:
             if move.kind == "pawn" and move.to:
                 x, y = self.board_to_pixel(move.to)
@@ -126,7 +181,7 @@ class PygameHotseatUI:
                 )
 
     def draw_status(self):
-        status = f"Player {self.state.current_player + 1} turn | Shared Walls Left: {self.state.shared_walls_remaining} | Orientation: {'H' if self.wall_orientation_horizontal else 'V'}"
+        status = f"Player {self.state.current_player + 1} ({self.active_agent().name}) | Walls: {self.state.shared_walls_remaining} | {'H' if self.wall_orientation_horizontal else 'V'}"
         if self.state.winner is not None:
             status = f"Winner: Player {self.state.winner + 1} - Press ESC to quit"
         surf = self.font.render(status, True, TEXT_COLOR)
@@ -134,19 +189,6 @@ class PygameHotseatUI:
 
     def active_agent(self) -> Agent:
         return self.agents[self.state.current_player]
-
-    def set_players(self, spec: str):
-        mapping = {"human": HumanAgent, "random": RandomAgent, "llm": LLMAgent}
-        parts = [p.strip().lower() for p in spec.split(",") if p.strip()]
-        if len(parts) == 2:
-            new_agents: list[Agent] = []
-            for p in parts:
-                cls = mapping.get(p)
-                if cls:
-                    new_agents.append(cls())
-            if len(new_agents) == 2:
-                self.agents = new_agents
-                self._sync_player_identities()
 
     def _sync_player_identities(self):
         metas = []
@@ -163,6 +205,11 @@ class PygameHotseatUI:
     def handle_click(self, pos):
         if self.state.winner is not None:
             return
+            
+        agent = self.active_agent()
+        if not agent.is_human:
+            return
+
         mx, my = pos
         if mx < PADDING or my < PADDING:
             return
@@ -170,30 +217,29 @@ class PygameHotseatUI:
         row = (my - PADDING) // CELL_SIZE
         if not (0 <= row < BOARD_SIZE and 0 <= col < BOARD_SIZE):
             return
+            
         keys = pygame.key.get_pressed()
         shift_down = keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT]
-        # If shift held: only attempt wall placement, suppress pawn movement
+        
         if shift_down:
             if self.state.shared_walls_remaining <= 0:
                 return
-            # Wall anchors are within 0..BOARD_SIZE-2
             if not (0 <= row < BOARD_SIZE - 1 and 0 <= col < BOARD_SIZE - 1):
                 return
             wall = Wall(row, col, self.wall_orientation_horizontal)
             for m in self.controller.legal_moves:
                 if m.kind == "wall" and m.wall == wall:
-                    agent = self.active_agent()
-                    if agent.is_human and hasattr(agent, "set_pending"):
+                    if hasattr(agent, "set_pending"):
                         agent.set_pending(m)  # type: ignore
                         self.apply_agent_move(agent)
                     return
-            return  # shift held but no legal wall here; do nothing
-        # Normal click (no shift): try pawn move only
+            return
+            
+        # Pawn move
         target = Position(row, col)
         for m in self.controller.legal_moves:
             if m.kind == "pawn" and m.to == target:
-                agent = self.active_agent()
-                if agent.is_human and hasattr(agent, "set_pending"):
+                if hasattr(agent, "set_pending"):
                     agent.set_pending(m)  # type: ignore
                     self.apply_agent_move(agent)
                 return
@@ -206,36 +252,31 @@ class PygameHotseatUI:
             return
         view = GameView(self.state)
         move = agent.choose_move(view)
-        # Validate move among legal moves
-        legal_keys = {
-            (
-                m.kind,
-                getattr(m.to, "row", None),
-                getattr(m.to, "col", None),
-                getattr(m.wall, "row", None),
-                getattr(m.wall, "col", None),
-                getattr(m.wall, "horizontal", None),
-            )
-            for m in view.legal_moves()
-        }
-        key = (
-            move.kind,
-            getattr(move.to, "row", None),
-            getattr(move.to, "col", None),
-            getattr(move.wall, "row", None),
-            getattr(move.wall, "col", None),
-            getattr(move.wall, "horizontal", None),
-        )
-        if key in legal_keys:
-            self.state = rules.apply_move(self.state, move)
-            self.controller.state = self.state
-            self.controller.refresh_moves()
+        
+        # Validate
+        # (Simplified validation: just check if move is in legal moves list)
+        # Note: strict validation is good but for now we trust the agent/controller sync
+        # Actually, we should validate because LLM might hallucinate
+        
+        legal_moves = list(view.legal_moves())
+        if move not in legal_moves:
+            print(f"Illegal move attempted by {agent.name}: {move}")
+            # For human, this shouldn't happen via UI. For LLM, it might.
+            # If LLM fails, we should probably have a fallback or retry, but LLMAgent handles that.
+            return
+
+        self.state = rules.apply_move(self.state, move)
+        self.controller.state = self.state
+        self.controller.refresh_moves()
 
     def maybe_ai_turn(self):
         if self.state.winner is not None:
             return
         agent = self.active_agent()
         if not agent.is_human:
+            # Small delay for UX?
+            # pygame.time.wait(100) # blocks UI, bad.
+            # Better: check timer. But for now, just run it.
             self.apply_agent_move(agent)
 
     def loop(self):
@@ -248,27 +289,25 @@ class PygameHotseatUI:
                         self.running = False
                     elif event.key == pygame.K_SPACE:
                         self.toggle_orientation()
+                    # Hotkeys for quick restarts (2p)
                     elif event.key == pygame.K_1:
-                        self.set_players("human,human")
+                        self.restart_game(["human", "human"])
                     elif event.key == pygame.K_2:
-                        self.set_players("human,random")
+                        self.restart_game(["human", "random"])
                     elif event.key == pygame.K_3:
-                        self.set_players("random,human")
+                        self.restart_game(["random", "human"])
                     elif event.key == pygame.K_4:
-                        self.set_players("random,random")
+                        self.restart_game(["random", "random"])
                     elif event.key == pygame.K_5:
-                        self.set_players("human,llm")
-                    elif event.key == pygame.K_6:
-                        self.set_players("llm,human")
-                    elif event.key == pygame.K_7:
-                        self.set_players("random,llm")
-                    elif event.key == pygame.K_8:
-                        self.set_players("llm,random")
-                    elif event.key == pygame.K_9:
-                        self.set_players("llm,llm")
+                        self.restart_game(["human", "llm"])
+                    # 4 player demo
+                    elif event.key == pygame.K_0:
+                        self.restart_game(["human", "random", "random", "random"])
+                        
                 elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                     self.handle_click(event.pos)
-            self.maybe_ai_turn()
+                    
+                    
             self.screen.fill(BG_COLOR)
             self.draw_grid()
             self.draw_highlights()
@@ -276,13 +315,21 @@ class PygameHotseatUI:
             self.draw_walls()
             self.draw_wall_ghost()
             self.draw_status()
+            self.draw_status()
             pygame.display.flip()
+            self.maybe_ai_turn()
             self.clock.tick(30)
         pygame.quit()
 
 
 def main():
-    ui = PygameHotseatUI()
+    parser = argparse.ArgumentParser(description="Quoridor Hotseat")
+    parser.add_argument("players", nargs="*", help="Player specs (e.g. human random llm:gpt-4)")
+    args = parser.parse_args()
+    
+    players = args.players if args.players else ["human", "human"]
+    
+    ui = PygameHotseatUI(players)
     ui.loop()
 
 

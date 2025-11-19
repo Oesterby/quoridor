@@ -24,8 +24,7 @@ class HotseatController:
 
     def set_player_identities(self, metas: list[dict]) -> None:
         # Expect each meta to have id,name,role
-        if len(metas) == 2:
-            self._players_meta = metas
+        self._players_meta = metas
 
     def refresh_moves(self) -> None:
         self._cached_moves = rules.legal_moves(self.state)
@@ -44,7 +43,12 @@ class HotseatController:
         ]
         # Serialize legal moves with stable IDs
         serialized_moves = []
-        current_player_name = self._players_meta[self.state.current_player]["name"]
+        # Ensure we have metadata for current player
+        if self.state.current_player < len(self._players_meta):
+            current_player_name = self._players_meta[self.state.current_player]["name"]
+        else:
+            current_player_name = f"Player {self.state.current_player + 1}"
+            
         current_from_row = self.state.pawns[self.state.current_player].row
         current_from_col = self.state.pawns[self.state.current_player].col
         for idx, m in enumerate(self._cached_moves):
@@ -72,28 +76,40 @@ class HotseatController:
         players = []
         for meta in self._players_meta:
             pid = meta["id"]
-            players.append(
-                {
-                    "id": pid,
-                    "name": meta["name"],
-                    "row": self.state.pawns[pid].row,
-                    "col": self.state.pawns[pid].col,
-                }
-            )
-        goal_rows = [
-            {
-                "id": 0,
-                "name": self._players_meta[0]["name"],
-                "row": rules.BOARD_SIZE - 1 if hasattr(rules, "BOARD_SIZE") else 8,
-            },
-            {"id": 1, "name": self._players_meta[1]["name"], "row": 0},
-        ]
+            # Ensure we don't go out of bounds if state has fewer pawns than meta (shouldn't happen)
+            if pid < len(self.state.pawns):
+                players.append(
+                    {
+                        "id": pid,
+                        "name": meta["name"],
+                        "row": self.state.pawns[pid].row,
+                        "col": self.state.pawns[pid].col,
+                    }
+                )
+        
+        # Dynamic goal rows/cols based on player count
+        goals = []
+        board_size = rules.BOARD_SIZE if hasattr(rules, "BOARD_SIZE") else 9
+        for i in range(len(self._players_meta)):
+            name = self._players_meta[i]["name"]
+            if i == 0:
+                goals.append({"id": 0, "name": name, "row": board_size - 1})
+            elif i == 1:
+                if len(self._players_meta) == 2:
+                    goals.append({"id": 1, "name": name, "row": 0})
+                else:
+                    goals.append({"id": 1, "name": name, "col": 0})
+            elif i == 2:
+                goals.append({"id": 2, "name": name, "row": 0})
+            elif i == 3:
+                goals.append({"id": 3, "name": name, "col": board_size - 1})
+
         winner_entry = (
             None
             if self.state.winner is None
             else {
                 "id": self.state.winner,
-                "name": self._players_meta[self.state.winner]["name"],
+                "name": self._players_meta[self.state.winner]["name"] if self.state.winner < len(self._players_meta) else f"Player {self.state.winner+1}",
             }
         )
         snapshot = {
@@ -101,15 +117,15 @@ class HotseatController:
             "turn": self.turn,
             "current_player": {
                 "id": self.state.current_player,
-                "name": self._players_meta[self.state.current_player]["name"],
+                "name": current_player_name,
             },
             "board": {
-                "size": rules.BOARD_SIZE if hasattr(rules, "BOARD_SIZE") else 9,
+                "size": board_size,
                 "walls": walls,
             },
             "players": players,
             "shared_walls_remaining": self.state.shared_walls_remaining,
-            "goal_rows": goal_rows,
+            "goals": goals,
             "winner": winner_entry,
             "legal_moves": serialized_moves,
         }

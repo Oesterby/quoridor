@@ -5,10 +5,10 @@ from ...engine.state import Move
 
 
 class HumanAgent:
-    name = "Human"
     is_human = True
 
-    def __init__(self):
+    def __init__(self, name: str = "Human"):
+        self.name = name
         self.pending_move: Optional[Move] = None
 
     def set_pending(self, move: Move):

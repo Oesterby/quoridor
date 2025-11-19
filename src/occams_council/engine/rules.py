@@ -1,10 +1,6 @@
 from __future__ import annotations
-from typing import List, Dict, Set, Tuple
+from typing import List, Dict, Set, Tuple, Callable
 from .state import GameState, Position, Move, Wall, BOARD_SIZE
-
-# Adjacency is affected by walls. We model walls as occupying edges between cells.
-# Simplified representation: For each cell we test if movement in a direction is blocked by a wall.
-# Wall placement validity requires: within bounds, not overlapping/crossing existing walls, and paths remain for both players.
 
 # Directions: up, down, left, right
 DIRS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
@@ -52,52 +48,62 @@ def generate_pawn_moves(state: GameState) -> List[Move]:
     blocked = _build_blocked(state)
     moves: List[Move] = []
     me = state.current_player
-    other = 1 - me
     my_pos = state.pawns[me]
-    opp_pos = state.pawns[other]
+    
+    # Identify positions of all other pawns
+    other_positions = {
+        (p.row, p.col) 
+        for i, p in enumerate(state.pawns) 
+        if i != me
+    }
 
     for dr, dc in DIRS:
         nr, nc = my_pos.row + dr, my_pos.col + dc
         if not in_bounds(nr, nc):
             continue
+        
         # edge blocked?
         if _is_blocked(blocked, my_pos.row, my_pos.col, dr, dc):
             continue
-        if nr == opp_pos.row and nc == opp_pos.col:
+            
+        if (nr, nc) in other_positions:
             # opponent adjacent; try straight jump first
             jr, jc = nr + dr, nc + dc
-            if in_bounds(jr, jc) and not _is_blocked(
-                blocked, opp_pos.row, opp_pos.col, dr, dc
-            ):
-                # ensure jump edge not blocked from opponent side
+            
+            # Check if jump is blocked by wall OR by another pawn
+            jump_blocked_by_wall = _is_blocked(blocked, nr, nc, dr, dc)
+            jump_blocked_by_pawn = (jr, jc) in other_positions
+            
+            if in_bounds(jr, jc) and not jump_blocked_by_wall and not jump_blocked_by_pawn:
                 moves.append(Move(kind="pawn", to=Position(jr, jc)))
             else:
                 # jump blocked or out of bounds -> try diagonals
-                if (
-                    dr != 0
-                ):  # moving vertically, diagonals left/right relative to opponent
-                    diag_options = [(dr, 1), (dr, -1)]
-                else:  # moving horizontally, diagonals up/down relative to opponent
-                    diag_options = [(1, dc), (-1, dc)]
-                for ddr, ddc in diag_options:
-                    rr = my_pos.row + ddr
-                    cc = my_pos.col + ddc
-                    # To reach diagonal, path consists of edge to opponent (already verified not blocked) AND sideways from opponent.
-                    # Check bounds and block from opponent position towards diagonal target (difference = (ddr - dr, ddc - dc)?) Simpler: compute opponent->target delta.
-                    if not in_bounds(rr, cc):
+                # Diagonals are relative to the opponent we are facing
+                if dr != 0:  # moving vertically
+                    diag_options = [(dr, 1), (dr, -1)] # (1,1), (1,-1) or (-1,1), (-1,-1) relative to my_pos? No.
+                    # If I move (1,0) to opp, diag is (1,1) and (1,-1) from ME.
+                    # Which is (0,1) and (0,-1) from OPP.
+                    # Let's use the logic: from OPP, move perpendicular to original direction
+                    ortho_dirs = [(0, 1), (0, -1)]
+                else:  # moving horizontally
+                    ortho_dirs = [(1, 0), (-1, 0)]
+                
+                for odr, odc in ortho_dirs:
+                    # Target is opponent pos + ortho dir
+                    tr, tc = nr + odr, nc + odc
+                    
+                    if not in_bounds(tr, tc):
                         continue
-                    # Ensure initial adjacency not blocked (already confirmed) AND sideways from opponent to target not blocked.
-                    opp_to_diag_dr = rr - opp_pos.row
-                    opp_to_diag_dc = cc - opp_pos.col
-                    if _is_blocked(
-                        blocked,
-                        opp_pos.row,
-                        opp_pos.col,
-                        opp_to_diag_dr,
-                        opp_to_diag_dc,
-                    ):
+                        
+                    # Check if path from opponent to target is blocked by wall
+                    if _is_blocked(blocked, nr, nc, odr, odc):
                         continue
-                    moves.append(Move(kind="pawn", to=Position(rr, cc)))
+                        
+                    # Check if target is occupied by another pawn
+                    if (tr, tc) in other_positions:
+                        continue
+                        
+                    moves.append(Move(kind="pawn", to=Position(tr, tc)))
         else:
             moves.append(Move(kind="pawn", to=Position(nr, nc)))
 
@@ -110,15 +116,7 @@ def generate_pawn_moves(state: GameState) -> List[Move]:
 
 
 def generate_wall_moves(state: GameState) -> List[Move]:
-    """Return only wall placements that preserve at least one path to goal for both players.
-
-    Enforces:
-    - No overlapping walls (cannot reuse same blocked edges)
-    - No crossing (disallow placing a horizontal and vertical wall with same anchor producing an X)
-      (Note: meeting at edges is naturally handled by distinct anchors.)
-    - Path continuity: both players must retain at least one path to goal.
-    """
-    # Shared wall pool gating
+    """Return only wall placements that preserve at least one path to goal for ALL players."""
     if state.shared_walls_remaining <= 0:
         return []
     moves: List[Move] = []
@@ -132,16 +130,13 @@ def generate_wall_moves(state: GameState) -> List[Move]:
         r: int, c: int, horizontal: bool
     ) -> List[Tuple[Tuple[int, int], Tuple[int, int]]]:
         if horizontal:
-            # edges between (r,c)-(r+1,c) and (r,c+1)-(r+1,c+1)
             return [((r, c), (r + 1, c)), ((r, c + 1), (r + 1, c + 1))]
         else:
-            # edges between (r,c)-(r,c+1) and (r+1,c)-(r+1,c+1)
             return [((r, c), (r, c + 1)), ((r + 1, c), (r + 1, c + 1))]
 
     for r, c, horiz in state.walls:
         (existing_horizontal if horiz else existing_vertical).add((r, c))
         for e in wall_edges(r, c, horiz):
-            # Normalize edge ordering
             a, b = e
             if a > b:
                 a, b = b, a
@@ -154,12 +149,12 @@ def generate_wall_moves(state: GameState) -> List[Move]:
                 wkey = wall.key()
                 if wkey in state.walls:
                     continue
-                # Crossing check: block if opposite orientation already at same anchor
+                # Crossing check
                 if horizontal and (r, c) in existing_vertical:
                     continue
                 if not horizontal and (r, c) in existing_horizontal:
                     continue
-                # Overlap check: candidate edges must be unused
+                # Overlap check
                 candidate_edges = []
                 for e in wall_edges(r, c, horizontal):
                     a, b = e
@@ -168,11 +163,14 @@ def generate_wall_moves(state: GameState) -> List[Move]:
                     candidate_edges.append((a, b))
                 if any(e in blocked_edges for e in candidate_edges):
                     continue
+                
                 # simulate
+                # Optimization: Check path validity only if it blocks a critical path?
+                # For now, just simulate.
                 temp = state.clone()
                 temp.walls.add(wkey)
                 blocked = _build_blocked(temp)
-                if _both_players_have_path(temp, blocked):
+                if _all_players_have_path(temp, blocked):
                     moves.append(Move(kind="wall", wall=wall))
     return moves
 
@@ -190,31 +188,46 @@ def apply_move(state: GameState, move: Move) -> GameState:
     elif move.kind == "wall" and move.wall:
         new_state.walls.add(move.wall.key())
         new_state.shared_walls_remaining -= 1
+    
     new_state.check_winner()
     if not new_state.is_terminal():
-        new_state.current_player = 1 - new_state.current_player
+        new_state.current_player = (new_state.current_player + 1) % new_state.num_players
     return new_state
 
 
-def _goal_rows_for(player: int) -> Set[int]:
-    return {BOARD_SIZE - 1} if player == 0 else {0}
+def _get_goal_check(player: int, num_players: int) -> Callable[[int, int], bool]:
+    if player == 0:
+        return lambda r, c: r == BOARD_SIZE - 1
+    elif player == 1:
+        if num_players == 2:
+            return lambda r, c: r == 0
+        else:
+            return lambda r, c: c == 0
+    elif player == 2:
+        return lambda r, c: r == 0
+    elif player == 3:
+        return lambda r, c: c == BOARD_SIZE - 1
+    return lambda r, c: False
 
 
 def _player_has_path(
     state: GameState, blocked: Dict[Tuple[int, int], Set[Tuple[int, int]]], player: int
 ) -> bool:
     start = state.pawns[player]
-    goal_rows = _goal_rows_for(player)
-    if start.row in goal_rows:
+    is_goal = _get_goal_check(player, state.num_players)
+    
+    if is_goal(start.row, start.col):
         return True
+        
     from collections import deque
 
     visited = [[False] * BOARD_SIZE for _ in range(BOARD_SIZE)]
     q = deque([(start.row, start.col)])
     visited[start.row][start.col] = True
+    
     while q:
         r, c = q.popleft()
-        if r in goal_rows:
+        if is_goal(r, c):
             return True
         for dr, dc in DIRS:
             nr, nc = r + dr, c + dc
@@ -228,7 +241,11 @@ def _player_has_path(
     return False
 
 
-def _both_players_have_path(
+def _all_players_have_path(
     state: GameState, blocked: Dict[Tuple[int, int], Set[Tuple[int, int]]]
 ) -> bool:
-    return _player_has_path(state, blocked, 0) and _player_has_path(state, blocked, 1)
+    for p in range(state.num_players):
+        if not _player_has_path(state, blocked, p):
+            return False
+    return True
+
